@@ -2,3 +2,5 @@ logs/*
 *.bin
 keys/
 report_exe/build/
+report_exe/dist/
+*.spec
