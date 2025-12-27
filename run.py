@@ -5,6 +5,7 @@ import argparse
 import statistics
 import re
 import multiprocessing
+import bisect
 from functools import partial
 
 # --- 核心辅助函数 ---
@@ -23,29 +24,21 @@ def extract_hms_from_timestamp(timestamp):
 def extract_md_from_timestamp(timestamp):
     return time.strftime('%m%d', time.localtime(timestamp))
 
-# --- 预编译正则 ---
-# 匹配逻辑：找到最后两个被引号包裹的字符串（JobName和Command），紧接着是CPU时间
-CPU_TIME_PATTERN = re.compile(r'"([^"]*)"\s+"([^"]*)"\s+([0-9\.]+)')
+# --- 正则修复 ---
+# 旧正则: r'"([^"]*)"...' 遇到 "" 会失败
+# 新正则: r'"((?:[^"]|"")*)"...' 能匹配包含 "" 的字段
+CPU_TIME_PATTERN = re.compile(r'"((?:[^"]|"")*)"\s+"((?:[^"]|"")*)"\s+([0-9\.]+)')
 
 def process_single_file(file_path, year, year_start, year_end):
-    """
-    单个文件处理函数
-    """
+    """ 单个文件处理函数 """
     local_data = []
+    if not os.path.exists(file_path): return []
     
-    if not os.path.exists(file_path):
-        return []
-
-    # 获取当前进程ID，方便查看并行状态
-    pid = os.getpid()
-    print(f"🚀 [PID {pid}] Start processing: {os.path.basename(file_path)}")
-    
+    print(f"🚀 [PID {os.getpid()}] Processing: {os.path.basename(file_path)}")
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
-                if "JOB_FINISH" not in line:
-                    continue
-
+                if "JOB_FINISH" not in line: continue
                 try:
                     parts = line.split()
                     if len(parts) < 20: continue
@@ -56,30 +49,67 @@ def process_single_file(file_path, year, year_start, year_end):
                     timestart_stamp = int(parts[10])
                     timeend_stamp = int(parts[2])
                     
-                    # 尝试提取核心数，默认位置23
-                    try:
-                        cores = int(parts[23]) 
-                    except (IndexError, ValueError):
-                        cores = 1 # 兜底
+                    try: cores = int(parts[23]) 
+                    except: cores = 1
 
                     if timestart_stamp == 0: continue
+                    if not check_timestamp_is_inside(year_start, year_end, timesub_stamp): continue
+
+                    # --- 修复核心：智能提取 CPU Time ---
+                    matches = CPU_TIME_PATTERN.findall(line)
+                    cpu_time = 0.0
+                    command_str = ""
                     
-                    if not check_timestamp_is_inside(year_start, year_end, timesub_stamp):
-                        continue
+                    found_valid_cpu = False
+                    for m in matches:
+                        # m = (Group1_Str, Group2_Str, Group3_Num)
+                        g1_str = m[0]
+                        g2_str = m[1]
+                        g3_num = m[2]
 
-                    # 正则提取 Command 和 CPU Time
-                    match = CPU_TIME_PATTERN.search(line)
-                    if match:
-                        command_str = match.group(2) # 保持原始大小写，后面再 lower()
-                        cpu_time = float(match.group(3))
-                    else:
-                        continue
+                        try:
+                            val = float(g3_num)
+                            
+                            # 1. 过滤头部的时间戳 (Group2如果是纯数字字符串，通常是timestamp)
+                            #    例如: "%J.err" "1733150264.13" 0
+                            try:
+                                if float(g2_str) > 0: 
+                                    continue # Group2 是数字，说明这是 timestamp 字段，跳过
+                            except:
+                                pass # Group2 不是数字，可能是 Command，继续检查
 
-                    # --- 用户自定义软件识别逻辑 (完全恢复) ---
+                            # 2. 过滤 JOB_FINISH
+                            if g1_str == "JOB_FINISH": continue
+                            
+                            # 3. 过滤 "default" (Ask String 字段)
+                            if g2_str == "default": continue
+
+                            # 4. 过滤 Host 列表 (通常 Host1 == Host2，或者是在 Host 列表末尾)
+                            #    例如: "hostA" "hostA" 64 (Int)
+                            #    而 Command 字段通常 G1(JobName) != G2(Command)
+                            if g1_str == g2_str: continue
+                            
+                            # 5. 过滤空字符串
+                            if g1_str == "" and g2_str == "": continue
+
+                            # 通过所有过滤，认为是有效的 CPU Time
+                            # 我们不断更新 cpu_time，因为 LSF 日志中 Command 字段出现在 Host 字段之后
+                            # 最后的有效匹配通常就是 Command
+                            command_str = g2_str
+                            cpu_time = val
+                            found_valid_cpu = True
+
+                        except:
+                            continue
+                            
+                    if not found_valid_cpu:
+                        continue
+                    # -------------------------------
+
+                    # 软件识别
                     soft_mark = 0
                     line_soft = line.lower()   
-                    software = "others" # 默认值，防止没匹配上
-
+                    software = "others"
                     if "g16" in line_soft or "g09" in line_soft or "g03" in line_soft and ".gjf" in line_soft and soft_mark == 0:
                         software = "gaussian"
                         soft_mark = 1
@@ -153,136 +183,140 @@ def process_single_file(file_path, year, year_start, year_end):
                         software = "others"
                         soft_mark = 1
                     # --- 逻辑结束 ---
-
+                    
                     run_time = timeend_stamp - timestart_stamp
                     wait_time = timestart_stamp - timesub_stamp
-
-                    if run_time > 365 * 24 * 3600: continue 
-                    if wait_time > 365 * 24 * 3600: continue
                     
+                    # 宽松过滤，保留真实长作业
+                    if run_time > 365 * 86400: continue
+                    if wait_time > 365 * 86400: continue
+
                     local_data.append([user, queue, timesub_stamp, cores, software, wait_time, run_time, cpu_time])
-                
-                except (IndexError, ValueError):
-                    continue
-                    
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-
-    print(f"✅ [PID {pid}] Finished {os.path.basename(file_path)}: {len(local_data)} jobs")
+                except: continue
+    except Exception as e: print(f"Error: {e}")
+    print(f"✅ [PID {os.getpid()}] Finished {os.path.basename(file_path)}: {len(local_data)} jobs")
     return local_data
 
+def calculate_distribution(data_list):
+    """
+    计算数据的频次分布 (更新后的细致分桶)
+    """
+    # 边界定义 (秒)
+    # <10s, 10-30s, 30s-1m, 1m-10m, 10m-30m, 30m-1h, 1h-4h, 4h-1d, 1d-3d, 3d-7d, >7d
+    boundaries = [
+        10, 
+        30, 
+        60,       # 1m
+        600,      # 10m
+        1800,     # 30m
+        3600,     # 1h
+        14400,    # 4h
+        86400,    # 1d
+        259200,   # 3d
+        604800    # 7d
+    ]
+    labels = [
+        "<10s", "10~30s", "30s~1m", 
+        "1m~10m", "10m~30m", "30m~1h", 
+        "1h~4h", "4h~1d", "1d~3d", 
+        "3d~7d", ">7d"
+    ]
+    counts = [0] * len(labels)
+    
+    for val in data_list:
+        idx = bisect.bisect_right(boundaries, val)
+        counts[idx] += 1
+        
+    return dict(zip(labels, counts))
+
 def main():
-    argparser = argparse.ArgumentParser(description='Cluster Job Analyzer (Fast + Safe)')
-    argparser.add_argument('-d', '--dir', help='Log directory', required=True, dest='dir')
-    argparser.add_argument('-y', '--year', help='Year to analyse', required=True, dest='year', type=int)
-    # 新增参数：限制使用的最大核心数
-    argparser.add_argument('-c', '--cores', help='Max CPU cores to use (Default: 8)', default=8, type=int)
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument('-d', '--dir', required=True)
+    argparser.add_argument('-y', '--year', type=int, required=True)
+    argparser.add_argument('-c', '--cores', default=8, type=int)
     args = argparser.parse_args()
 
-    start_time_counter = time.time()
+    start_t = time.time()
+    year_start = mytime_2_timestamp(f"{args.year},01,01,00,00,00")
+    year_end = mytime_2_timestamp(f"{args.year},12,31,23,59,59")
 
-    year_start = mytime_2_timestamp(str(args.year) + ",01,01,00,00,00")
-    year_end = mytime_2_timestamp(str(args.year) + ",12,31,23,59,59")
+    # 1. 读取假期数据 (修复点)
+    holiday_set = set()
+    if os.path.exists("holidays.txt"):
+        with open("holidays.txt", 'r') as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == str(args.year):
+                    holiday_set.add(parts[1]) # 格式 MMDD
+    else:
+        print("Warning: holidays.txt not found. Holiday count will be 0.")
 
     log_files = []
     if os.path.exists(args.dir):
-        for f in os.listdir(args.dir):
-            if "lsb.acct" in f:
-                log_files.append(os.path.join(args.dir, f))
-    
-    # --- 智能计算并发数 ---
-    # 1. 用户设定的限制 (args.cores)
-    # 2. 实际文件数量 (log_files) - 文件少就不需要开那么多进程
-    # 3. 机器物理核心数 (os.cpu_count()) - 防止用户设定 9999
-    real_cpu_count = os.cpu_count() or 1
-    safe_cores = min(args.cores, len(log_files), real_cpu_count)
-    
-    # 如果 args.cores 强制指定很大，但文件也很多，为了安全我们还是尊重 args.cores，
-    # 但建议不要超过物理核。这里逻辑是：只要不超过文件数（没必要）即可。
-    # 最终逻辑：取 (用户限制) 和 (文件数) 的较小值。
-    # 注意：如果 args.cores 设得比物理核还大，python 会自动调度，虽然慢但不会崩，
-    # 但通常我们希望受限于 args.cores。
-    pool_size = min(args.cores, len(log_files))
+        log_files = [os.path.join(args.dir, f) for f in os.listdir(args.dir) if "lsb.acct" in f]
+
+    # 智能核数
+    real_cpu = os.cpu_count() or 1
+    pool_size = min(args.cores, len(log_files), real_cpu)
     if pool_size < 1: pool_size = 1
 
-    print(f"Found {len(log_files)} lsb.acct files.")
-    print(f"Starting multiprocessing pool with {pool_size} processes (User limit: {args.cores})...")
-
-    with multiprocessing.Pool(processes=pool_size) as pool:
+    print(f"Processing {len(log_files)} files with {pool_size} processes...")
+    with multiprocessing.Pool(pool_size) as pool:
         func = partial(process_single_file, year=args.year, year_start=year_start, year_end=year_end)
-        results_list = pool.map(func, log_files)
+        results = pool.map(func, log_files)
 
-    raw_data = []
-    for res in results_list:
-        raw_data.extend(res)
+    raw_data = [item for sublist in results for item in sublist]
+    print(f"Total jobs: {len(raw_data)}. Analyzing...")
 
-    print(f"Data processing finished in {time.time() - start_time_counter:.2f} seconds.")
-    print(f"Total valid jobs: {len(raw_data)}. Calculating statistics...")
-
-    # --- 统计部分 (保持不变) ---
-    holiday_date = []
-    if os.path.exists("holidays.txt"):
-        with open("holidays.txt", 'r') as f:
-            holiday_raw = f.readlines()
-        for line in holiday_raw:
-            parts = line.split()
-            if len(parts) == 2 and parts[0] == str(args.year):
-                holiday_date.append(parts[1])
-
-    base_user_dict = {
+    # 初始化结构
+    base_dict = {
         'jobs_count': 0, 'runtime_sum': 0, 'cpu_time_sum': 0,
         'date': {}, 'queue': {}, 'software': {},
         'latest_time': "000000", 'latest_time_date': "0101",
-        'biggest_runtime': 0, 'biggest_cpu_time': 0, 'biggest_wait_time': 0,
+        'biggest_runtime': 0, 'biggest_wait_time': 0,
         'runtime': [], 'wait_time': [], 'efficiency': [],
         'holiday_count': 0,
-        'time_period': {"1-6": 0, "7-12": 0, "13-18": 0, "19-24": 0}
+        'time_period': {"1-6": 0, "7-12": 0, "13-18": 0, "19-24": 0},
+        'dist_runtime': {}, 'dist_waittime': {} 
     }
     
-    all_dict = {"all": pickle.loads(pickle.dumps(base_user_dict))}
+    all_dict = {"all": pickle.loads(pickle.dumps(base_dict))}
 
     for job in raw_data:
-        user = job[0]
-        queue = job[1]
-        sub_time_hms = int(extract_hms_from_timestamp(job[2]))
-        date_md = extract_md_from_timestamp(job[2])
-        cores = job[3]
-        software = job[4]
-        wait_time = job[5]
-        run_time = job[6]
-        cpu_time = job[7]
+        user, queue, sub_ts, cores, soft, wait, run, cpu = job
+        date_md = extract_md_from_timestamp(sub_ts)
+        sub_hms = int(extract_hms_from_timestamp(sub_ts))
         
-        eff = 0
-        if run_time > 0 and cores > 0:
-            eff = (cpu_time / (run_time * cores)) * 100 
-            if eff > 100: eff = 100
+        eff = (cpu / (run * cores)) * 100 if run > 0 and cores > 0 else 0
+        if eff > 100: eff = 100
 
-        if user not in all_dict:
-            all_dict[user] = pickle.loads(pickle.dumps(base_user_dict))
+        if user not in all_dict: all_dict[user] = pickle.loads(pickle.dumps(base_dict))
 
         for target in [user, "all"]:
             d = all_dict[target]
             d['jobs_count'] += 1
-            d['runtime_sum'] += run_time
-            d['cpu_time_sum'] += cpu_time
+            d['runtime_sum'] += run
+            d['cpu_time_sum'] += cpu
             d['date'][date_md] = d['date'].get(date_md, 0) + 1
             d['queue'][queue] = d['queue'].get(queue, 0) + 1
-            d['software'][software] = d['software'].get(software, 0) + 1
-            d['runtime'].append(run_time)
-            d['wait_time'].append(wait_time)
+            d['software'][soft] = d['software'].get(soft, 0) + 1
+            d['runtime'].append(run)
+            d['wait_time'].append(wait)
             d['efficiency'].append(eff)
+            
+            # 2. 统计假期内卷 (修复点)
+            if date_md in holiday_set:
+                d['holiday_count'] += 1
 
-            if 0 <= sub_time_hms < 60000: d['time_period']["1-6"] += 1
-            elif sub_time_hms < 120000: d['time_period']["7-12"] += 1
-            elif sub_time_hms < 180000: d['time_period']["13-18"] += 1
+            if sub_hms < 60000: d['time_period']["1-6"] += 1
+            elif sub_hms < 120000: d['time_period']["7-12"] += 1
+            elif sub_hms < 180000: d['time_period']["13-18"] += 1
             else: d['time_period']["19-24"] += 1
-            
-            if run_time > d['biggest_runtime']: d['biggest_runtime'] = run_time
-            if cpu_time > d['biggest_cpu_time']: d['biggest_cpu_time'] = cpu_time
-            if wait_time > d['biggest_wait_time']: d['biggest_wait_time'] = wait_time
-            
-            if sub_time_hms < 60000 and sub_time_hms > int(d['latest_time']):
-                d['latest_time'] = str(sub_time_hms).zfill(6)
+
+            if run > d['biggest_runtime']: d['biggest_runtime'] = run
+            if wait > d['biggest_wait_time']: d['biggest_wait_time'] = wait
+            if sub_hms < 60000 and sub_hms > int(d['latest_time']):
+                d['latest_time'] = str(sub_hms).zfill(6)
                 d['latest_time_date'] = date_md
 
     for user in all_dict:
@@ -294,23 +328,20 @@ def main():
         d['mean_waittime'] = int(statistics.mean(d['wait_time']))
         d['median_waittime'] = int(statistics.median(d['wait_time']))
         d['mean_efficiency'] = round(statistics.mean(d['efficiency']), 2) if d['efficiency'] else 0.0
-
-        d['most_freq_date'] = max(d['date'], key=d['date'].get)
-        d['least_freq_date'] = min(d['date'], key=d['date'].get)
         
-        if user != "all":
-            for date_key, count in d['date'].items():
-                if date_key in holiday_date:
-                    d['holiday_count'] += count
+        d['most_freq_date'] = max(d['date'], key=d['date'].get)
+
+        # 计算分布
+        d['dist_runtime'] = calculate_distribution(d['runtime'])
+        d['dist_waittime'] = calculate_distribution(d['wait_time'])
 
         del d['runtime']
         del d['wait_time']
         del d['efficiency']
 
-    filename = str(args.year) + ".bin"
-    with open(filename, 'wb') as f:
+    with open(f"{args.year}.bin", 'wb') as f:
         pickle.dump(all_dict, f)
-    print(f"Done. Saved to {filename}")
+    print(f"Done. Saved {args.year}.bin")
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()
